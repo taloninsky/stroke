@@ -582,3 +582,49 @@ behavioral requirements from D1â€“D5 that cannot be unit-tested.
 - Performance benchmarks. v0.1 must feel responsive on a normal laptop;
   if it does not, that is a bug to fix before declaring done, not a
   separate measurement.
+
+---
+
+## Implementation status (post-D7)
+
+This section tracks how each accepted decision is realized in code, plus any deviations or wrinkles surfaced during implementation.
+
+### D1 — Mouse round-trip
+
+- ? Mouse ? Pointer Events flow through src/capture.rs.
+- ? Save/Open via src/persist.rs.
+- ?? Lossless JSON round-trip is unit-tested (document::tests); end-to-end S12/S13 still a manual runbook step.
+
+### D2 — Pointer Events
+
+- ? src/capture.rs listens on the committed canvas only; pointerdown/move/up/leave/cancel handled.
+- ? Single-click strokes (< 2 points) discarded — would be invisible under incremental rendering.
+- ? `timeStamp` from PointerEvent recorded as Point.t (ms since navigation start).
+
+### D3 — Document schema
+
+- ? `src/document.rs` types match the spec field-for-field; 6 unit tests cover round-trip + schema rejection.
+
+### D4 — Two-canvas rendering
+
+- ? `src/render.rs` owns `stroke-committed` and `stroke-live`; DPR-aware sizing + `ctx.scale`.
+- ? `begin_live` / `extend_live` / `commit_stroke` / `discard_live` / `repaint_committed` are the full API; `capture` and `persist` are the only callers.
+
+### D5 — Persistence
+
+- ? `src/persist.rs` implements FSA-only via a tiny `inline_js` bridge (5 functions). Avoided the `web_sys_unstable_apis` cfg flag in favor of a hand-rolled, type-checked surface.
+- ? Held `FileSystemFileHandle` for silent overwrite.
+- ? Schema-strict load with atomic replacement (parse before mutating).
+- ? `beforeunload` guard installed in `app.rs` once at mount; reads live `dirty` signal each fire.
+- ? Confirm-discard prompt on Open via `window.confirm`.
+- ?? v0.1 surfaces persist errors to the dev console only (spec says "error message"); a UI affordance is deferred to v0.2.
+
+### D6 — Tech stack
+
+- ? Single binary crate, Dioxus 0.7.5 pinned to match the installed `dx` CLI.
+- ? Tailwind v4 via standalone binary in `tools/` (gitignored, fetched by `tools/fetch-tailwind.ps1`).
+
+### D7 — Manual runbook
+
+- ?? Pending first end-to-end pass (S1–S15) once render+capture+persist are wired together in a running `dx serve` session.
+

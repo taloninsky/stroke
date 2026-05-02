@@ -20,8 +20,8 @@ web-sys = { version = "0.3", features = [
     "Element",
     "HtmlElement",
     "DomRect",
-    "Blob",
-    "File",
+    "Performance",
+    "BeforeUnloadEvent",
     "console",
 ] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "wasmbind", "clock"] }
