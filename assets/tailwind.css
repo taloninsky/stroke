@@ -1,0 +1,5 @@
+@import "tailwindcss";
+
+/* Tell Tailwind v4 where to scan for class names. Dioxus components
+   are .rs files using rsx! macros; we scan all of src/. */
+@source "../src/**/*.rs";

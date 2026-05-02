@@ -1,0 +1,33 @@
+[package]
+name = "stroke"
+version = "0.1.0"
+edition = "2021"
+description = "Ink as a first-class data type. v0.1 prototype."
+
+[dependencies]
+dioxus = { version = "=0.7.5", features = ["web"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "PointerEvent",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "DomRect",
+    "Blob",
+    "File",
+    "console",
+] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "wasmbind", "clock"] }
+thiserror = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
