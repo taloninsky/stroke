@@ -1,16 +1,16 @@
 //! Top-level Dioxus application shell.
 //!
-//! v0.1 responsibilities:
+//! v0.2 responsibilities:
 //! - Mount the Tailwind stylesheet.
 //! - Detect File System Access API support; show the unsupported-browser
 //!   gate (D5) when missing and skip the canvas entirely.
-//! - When supported, render the toolbar (`Open`, `Save`) and the two
+//! - When supported, render the toolbar (`New`, `Open`, `Save`, `Save As`)
+//!   and the two
 //!   stacked canvases that `capture` and `render` will own.
 //!
-//! Capture, render, and persist modules wire up in subsequent steps.
-//! The shell deliberately does the minimum needed to prove the
-//! pipeline (Dioxus + Tailwind + WASM in the browser) before those
-//! modules land.
+//! Capture, render, history, and persist stay behind narrow module APIs so the
+//! Dioxus shell can own commands and visible status without owning canvas
+//! pixels.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -20,7 +20,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::capture;
-use crate::document::{Canvas, Document};
+use crate::document::{Canvas, Document, DocumentError};
+use crate::history::StrokeHistory;
 use crate::persist::{self, PersistError};
 use crate::render;
 
@@ -53,42 +54,56 @@ pub fn App() -> Element {
 fn SupportedShell() -> Element {
     // Document state lives outside Dioxus's reactive system because
     // the capture / render hot path must not trigger re-renders.
-    // The dirty flag is a signal so the toolbar can react to it.
+    // Dirty / file / error state are signals so the toolbar can react to them.
+    let document = use_hook(|| {
+        Rc::new(RefCell::new(Document::new(
+            1,
+            Canvas::css_px(1280.0, 800.0),
+        )))
+    });
+    let history = use_hook(|| Rc::new(RefCell::new(StrokeHistory::new())));
     let dirty = use_signal(|| false);
+    let current_file = use_signal(|| None::<String>);
+    let persist_error = use_signal(|| None::<String>);
+    let status_text = {
+        let is_dirty = dirty();
+        match current_file() {
+            Some(file_name) if is_dirty => format!("Stroke v0.2 - dirty - {file_name}"),
+            Some(file_name) => format!("Stroke v0.2 - saved - {file_name}"),
+            None => "Stroke v0.2 - unsaved new document".to_string(),
+        }
+    };
 
-    // Wire renderer + capture + persist once the canvas's parent
-    // container has actually been laid out at full size. We poll
-    // via `requestAnimationFrame`: Dioxus commits the DOM before
-    // `use_effect` fires, but the browser may not have finished
-    // flex layout yet — and one rAF is empirically not always
-    // enough (we have observed `flex-1` parents reporting only
-    // ~150px of height on the first rAF, then expanding to the
-    // viewport on the next). We retry until the parent reports a
-    // realistic size, with a hard cap so we cannot loop forever
-    // on a genuinely unsized container.
+    // Wire renderer + capture + persist once the canvas's parent container has
+    // actually been laid out. `render::init` owns ongoing resize observation;
+    // this startup wait only avoids claiming the canvas before flex layout has
+    // produced a meaningful first box.
+    let document_for_effect = document.clone();
+    let history_for_effect = history.clone();
     use_effect(move || {
         let dirty_handle = dirty;
+        let document = document_for_effect.clone();
+        let history = history_for_effect.clone();
         wait_for_layout_then(move || {
-            if let Err(err) = render::init() {
+            if let Err(err) = render::init(document.clone()) {
                 web_sys::console::error_1(&format!("render::init failed: {err}").into());
                 return;
             }
-
-            // Initial canvas size for the document is the live
-            // canvas's CSS size at mount time. Sufficient for v0.1
-            // (no resize handling). The exact value is not
-            // load-bearing — it only declares the coordinate frame
-            // for the file format.
-            let (w, h) = canvas_css_size("stroke-committed").unwrap_or((1280.0, 800.0));
-            let doc = Rc::new(RefCell::new(Document::new(1, Canvas::css_px(w, h))));
+            let (w, h) = render::current_css_size().unwrap_or((1280.0, 800.0));
+            *document.borrow_mut() = Document::new(1, Canvas::css_px(w, h));
 
             // `Signal` is `Copy`; we can call `.set` from a `Fn`
             // closure by moving the (copied) signal handle into it.
-            if let Err(err) = capture::init(doc.clone(), move || dirty_handle.clone().set(true)) {
+            let history_for_capture = history.clone();
+            if let Err(err) = capture::init(document.clone(), move || {
+                history_for_capture.borrow_mut().record_new_stroke();
+                dirty_handle.clone().set(true);
+            }) {
                 web_sys::console::error_1(&format!("capture::init failed: {err}").into());
             }
 
-            persist::init(doc);
+            persist::init(document.clone());
+            install_keyboard_shortcuts(document.clone(), history.clone(), dirty_handle);
 
             // beforeunload guard (D5). The browser only honors the
             // prompt when the listener sets `returnValue` to a
@@ -103,28 +118,60 @@ fn SupportedShell() -> Element {
     rsx! {
         div { class: "flex flex-col h-screen w-screen bg-white",
             // Toolbar.
-            div { class: "flex items-center gap-2 px-3 py-2 border-b border-gray-200",
+            div { class: "flex items-center gap-2 px-3 py-2 border-b border-gray-200 shrink-0",
                 button {
                     class: "px-3 py-1 rounded bg-gray-100 hover:bg-gray-200 \
                             text-gray-800 text-sm font-medium",
-                    onclick: move |_| {
-                        // Confirm-discard prompt when there are
-                        // unsaved changes (D5). If the user dismisses
-                        // the prompt we do not even open the picker.
-                        if dirty() && !confirm_discard() {
+                    onclick: {
+                        let document = document.clone();
+                        let history = history.clone();
+                        move |_| {
+                            if *dirty.peek()
+                                && !confirm_discard("Discard unsaved changes and create a new document?")
+                            {
+                                return;
+                            }
+                            create_new_document(
+                                document.clone(),
+                                history.clone(),
+                                dirty,
+                                current_file,
+                                persist_error,
+                            );
+                        }
+                    },
+                    "New"
+                }
+                button {
+                    class: "px-3 py-1 rounded bg-gray-100 hover:bg-gray-200 \
+                            text-gray-800 text-sm font-medium",
+                    onclick: {
+                        let history = history.clone();
+                        move |_| {
+                        if *dirty.peek()
+                            && !confirm_discard("Discard unsaved changes and open another file?")
+                        {
                             return;
                         }
-                        // `Signal: Copy`; rebind locally so we can
-                        // call `set` (which needs `&mut self`) from
-                        // inside this `Fn`-typed handler.
                         let mut dirty = dirty;
+                        let mut current_file = current_file;
+                        let mut persist_error = persist_error;
+                        let history = history.clone();
                         spawn(async move {
                             match persist::open().await {
-                                Ok(()) => dirty.set(false),
+                                Ok(file_name) => {
+                                    history.borrow_mut().clear();
+                                    dirty.set(false);
+                                    current_file.set(Some(file_name));
+                                    persist_error.set(None);
+                                }
                                 Err(PersistError::Cancelled) => {}
-                                Err(err) => report_persist_error("open", err),
+                                Err(err) => {
+                                    persist_error.set(Some(persist_error_message("Open", err)));
+                                }
                             }
                         });
+                        }
                     },
                     "Open"
                 }
@@ -133,18 +180,67 @@ fn SupportedShell() -> Element {
                             text-gray-800 text-sm font-medium",
                     onclick: move |_| {
                         let mut dirty = dirty;
+                        let mut current_file = current_file;
+                        let mut persist_error = persist_error;
                         spawn(async move {
                             match persist::save().await {
-                                Ok(()) => dirty.set(false),
+                                Ok(file_name) => {
+                                    dirty.set(false);
+                                    current_file.set(Some(file_name));
+                                    persist_error.set(None);
+                                }
                                 Err(PersistError::Cancelled) => {}
-                                Err(err) => report_persist_error("save", err),
+                                Err(err) => {
+                                    dirty.set(true);
+                                    persist_error.set(Some(persist_error_message("Save", err)));
+                                }
                             }
                         });
                     },
                     "Save"
                 }
-                span { class: "ml-auto text-xs text-gray-400",
-                    if dirty() { "Stroke v0.1 — unsaved changes" } else { "Stroke v0.1 — scaffold" }
+                button {
+                    class: "px-3 py-1 rounded bg-gray-100 hover:bg-gray-200 \
+                            text-gray-800 text-sm font-medium",
+                    onclick: move |_| {
+                        let mut dirty = dirty;
+                        let mut current_file = current_file;
+                        let mut persist_error = persist_error;
+                        spawn(async move {
+                            match persist::save_as().await {
+                                Ok(file_name) => {
+                                    dirty.set(false);
+                                    current_file.set(Some(file_name));
+                                    persist_error.set(None);
+                                }
+                                Err(PersistError::Cancelled) => {}
+                                Err(err) => {
+                                    dirty.set(true);
+                                    persist_error.set(Some(persist_error_message("Save As", err)));
+                                }
+                            }
+                        });
+                    },
+                    "Save As"
+                }
+                span {
+                    class: "ml-auto min-w-0 max-w-[45vw] truncate text-xs text-gray-500",
+                    title: "{status_text}",
+                    "{status_text}"
+                }
+            }
+
+            if let Some(message) = persist_error() {
+                div { class: "flex items-center gap-3 px-3 py-2 border-b border-red-200 bg-red-50 text-sm text-red-800 shrink-0",
+                    span { class: "min-w-0 flex-1", "{message}" }
+                    button {
+                        class: "px-2 py-1 rounded bg-white hover:bg-red-100 text-red-800 text-xs font-medium border border-red-200",
+                        onclick: move |_| {
+                            let mut persist_error = persist_error;
+                            persist_error.set(None);
+                        },
+                        "Dismiss"
+                    }
                 }
             }
 
@@ -179,7 +275,7 @@ fn UnsupportedGate() -> Element {
                     "Unsupported browser"
                 }
                 p { class: "text-sm text-gray-600",
-                    "Stroke v0.1 requires the File System Access API. \
+                    "Stroke v0.2 requires the File System Access API. \
                      Please open this app in a Chromium-based browser \
                      (Chrome, Edge, or equivalent)."
                 }
@@ -190,7 +286,7 @@ fn UnsupportedGate() -> Element {
 
 /// Returns `true` when `window.showSaveFilePicker` is defined.
 ///
-/// This is the v0.1 capability gate: full FSA support is required
+/// This is the v0.2 capability gate: full FSA support is required
 /// (D5). We probe a single function; the rest of the API ships
 /// together in every browser that has it.
 fn is_fsa_supported() -> bool {
@@ -294,7 +390,7 @@ fn install_beforeunload_guard(dirty: Signal<bool>) {
         return;
     };
     let closure = Closure::wrap(Box::new(move |event: web_sys::BeforeUnloadEvent| {
-        if dirty() {
+        if *dirty.peek() {
             event.prevent_default();
             event.set_return_value("");
         }
@@ -306,21 +402,103 @@ fn install_beforeunload_guard(dirty: Signal<bool>) {
     closure.forget();
 }
 
+/// Replace the current document with a blank unsaved one.
+fn create_new_document(
+    document: Rc<RefCell<Document>>,
+    history: Rc<RefCell<StrokeHistory>>,
+    mut dirty: Signal<bool>,
+    mut current_file: Signal<Option<String>>,
+    mut persist_error: Signal<Option<String>>,
+) {
+    let (w, h) = render::current_css_size().unwrap_or((1280.0, 800.0));
+    *document.borrow_mut() = Document::new(1, Canvas::css_px(w, h));
+    history.borrow_mut().clear();
+    persist::forget_handle();
+    {
+        let doc = document.borrow();
+        render::repaint_committed(&doc);
+    }
+    dirty.set(false);
+    current_file.set(None);
+    persist_error.set(None);
+}
+
+/// Installs document-level keyboard shortcuts for stroke history.
+fn install_keyboard_shortcuts(
+    document: Rc<RefCell<Document>>,
+    history: Rc<RefCell<StrokeHistory>>,
+    mut dirty: Signal<bool>,
+) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let closure = Closure::wrap(Box::new(move |event: web_sys::KeyboardEvent| {
+        if !event.ctrl_key() {
+            return;
+        }
+
+        let key = event.key().to_ascii_lowercase();
+        let redo = key == "y" || (key == "z" && event.shift_key());
+        let undo = key == "z" && !event.shift_key();
+        if !undo && !redo {
+            return;
+        }
+
+        event.prevent_default();
+        let changed = {
+            let mut doc = document.borrow_mut();
+            let mut history = history.borrow_mut();
+            if redo {
+                history.redo(&mut doc)
+            } else {
+                history.undo(&mut doc)
+            }
+        };
+
+        if changed {
+            {
+                let doc = document.borrow();
+                render::repaint_committed(&doc);
+            }
+            dirty.set(true);
+        }
+    }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+    let _ = window.add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
+    closure.forget();
+}
+
 /// Synchronous `window.confirm` prompt for the discard-unsaved
-/// flow on Open (D5). Returns `true` if the user accepted.
-fn confirm_discard() -> bool {
+/// flow on Open and New. Returns `true` if the user accepted.
+fn confirm_discard(message: &str) -> bool {
     web_sys::window()
-        .and_then(|w| {
-            w.confirm_with_message("Discard unsaved changes and open another file?")
-                .ok()
-        })
+        .and_then(|w| w.confirm_with_message(message).ok())
         .unwrap_or(false)
 }
 
-/// Logs persistence errors to the console. v0.1 does not surface a
-/// toast or modal — the spec calls only for "an error message", and
-/// the dev console is the agreed channel until a UI affordance is
-/// added.
-fn report_persist_error(op: &str, err: PersistError) {
-    web_sys::console::error_1(&format!("persist::{op} failed: {err}").into());
+/// Convert persistence failures into concise status text for the toolbar.
+fn persist_error_message(operation: &str, err: PersistError) -> String {
+    match err {
+        PersistError::Cancelled => String::new(),
+        PersistError::Document(DocumentError::InvalidJson(err)) => {
+            format!("{operation} failed: invalid JSON ({err})")
+        }
+        PersistError::Document(DocumentError::UnsupportedSchema(schema)) => {
+            format!("{operation} failed: unsupported schema version: {schema}")
+        }
+        PersistError::Js(message) if is_blocked_file_write_message(&message) => {
+            format!(
+                "{operation} failed: this browser context blocks file writes. Open Stroke in Chrome or Edge instead of VS Code Simple Browser."
+            )
+        }
+        PersistError::Js(message) => format!("{operation} failed: {message}"),
+    }
+}
+
+/// VS Code Simple Browser and other embedded browser contexts may expose enough
+/// of the File System Access API to show a picker, then reject `createWritable`.
+/// Surface that as an environment limitation instead of a mysterious save bug.
+fn is_blocked_file_write_message(message: &str) -> bool {
+    message.contains("createWritable")
+        || message.contains("not allowed by the user agent")
+        || message.contains("platform in the current context")
 }

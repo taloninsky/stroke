@@ -1,13 +1,13 @@
-//! Pointer-event capture (D2).
+//! Pointer-event capture (D2, D13).
 //!
 //! Translates Pointer Events on the canvas surface into `Stroke`s
 //! that are appended to the active document and rendered in real
-//! time. v0.1 scope:
+//! time. v0.2 scope:
 //!
 //! - Listen exclusively to Pointer Events (no mouse / touch events).
-//! - Sample `x`, `y`, `t` per point. Pressure / tilt / pointerType
-//!   are deliberately not recorded for v0.1 (a mouse reports
-//!   synthetic constants that would pollute the file).
+//! - Sample `x`, `y`, `t` per point and stroke-level `pointer_type`.
+//!   Pressure / tilt are deliberately not recorded until target-device
+//!   testing proves the browser reports meaningful values.
 //! - Capture the pointer on `pointerdown` so a stroke that strays
 //!   off the canvas during a drag is still tracked.
 //! - End the stroke cleanly on `pointerup`, `pointercancel`, or
@@ -25,16 +25,16 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlCanvasElement, PointerEvent};
 
-use crate::document::{Document, Point, Stroke};
+use crate::document::{Document, Point, PointerType, Stroke};
 use crate::render;
 
-/// v0.1 author identifier hardcoded into every captured stroke (D3).
+/// Author identifier hardcoded into every captured stroke (D3).
 const LOCAL_AUTHOR: &str = "local-user";
-/// v0.1 default stroke color (D3, D4).
+/// v0.2 default stroke color (D3, D4).
 const DEFAULT_COLOR: &str = "#000000";
-/// v0.1 default stroke width in CSS pixels (D3, D4).
+/// v0.2 default stroke width in CSS pixels (D3, D4).
 const DEFAULT_WIDTH: f64 = 2.0;
-/// v0.1 default tool (D3).
+/// v0.2 default tool (D3).
 const DEFAULT_TOOL: &str = "pen";
 
 /// Errors raised when wiring up capture.
@@ -145,7 +145,7 @@ fn attach(
 // ---- handlers -----------------------------------------------------------
 
 fn on_pointerdown(event: PointerEvent) {
-    // v0.1 tracks only the primary button (D2). For mouse this is
+    // Stroke tracks only the primary button (D2). For mouse this is
     // the left button (`button == 0`); pen reports `button == 0`
     // when the tip is down.
     if event.button() != 0 {
@@ -172,6 +172,7 @@ fn on_pointerdown(event: PointerEvent) {
         color: DEFAULT_COLOR.to_string(),
         width: DEFAULT_WIDTH,
         started_at: chrono::Utc::now(),
+        pointer_type: PointerType::from_browser(&event.pointer_type()),
         points: vec![point.clone()],
     };
 

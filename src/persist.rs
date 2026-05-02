@@ -1,10 +1,12 @@
 //! Persistence — File System Access API only (D5).
 //!
-//! v0.1 contract:
+//! v0.2 contract:
 //!
 //! - Save uses `window.showSaveFilePicker` on first use; the returned
 //!   file handle is held for the rest of the session so subsequent
 //!   saves overwrite silently.
+//! - Save As always prompts and replaces the active file handle only after a
+//!   successful write.
 //! - Open uses `window.showOpenFilePicker`, validates the schema
 //!   strictly, and replaces the in-memory document atomically. The
 //!   loaded handle becomes the active save target.
@@ -73,8 +75,9 @@ pub fn init(document: Rc<RefCell<Document>>) {
 ///
 /// First call shows the FSA save picker; subsequent calls write
 /// through the held handle silently (D5). On success the dirty flag
-/// should be cleared by the caller.
-pub async fn save() -> Result<(), PersistError> {
+/// should be cleared by the caller. Returns the active file name on success so
+/// the UI can identify what future Save operations will overwrite.
+pub async fn save() -> Result<String, PersistError> {
     let json = with_state(|state| state.document.borrow().to_json())?;
     let handle = current_handle();
 
@@ -99,18 +102,45 @@ pub async fn save() -> Result<(), PersistError> {
         .await
         .map_err(classify)?;
 
+    let file_name = handle_name(&active_handle).unwrap_or_else(|| "selected file".to_string());
     set_handle(active_handle);
-    Ok(())
+    Ok(file_name)
+}
+
+/// Save the current document to a newly selected file.
+///
+/// Unlike [`save`], this always prompts for a destination. The selected handle
+/// becomes active only after the write succeeds, so a failed Save As cannot
+/// accidentally retarget later Save operations.
+pub async fn save_as() -> Result<String, PersistError> {
+    let json = with_state(|state| state.document.borrow().to_json())?;
+    let suggested = with_state(|state| {
+        let doc = state.document.borrow();
+        suggested_filename(&doc)
+    });
+    let handle = match fsa_show_save_picker(&suggested).await {
+        Ok(h) if h.is_undefined() || h.is_null() => {
+            return Err(PersistError::Cancelled);
+        }
+        Ok(h) => h,
+        Err(e) => return Err(classify(e)),
+    };
+
+    fsa_write_text(&handle, &json).await.map_err(classify)?;
+
+    let file_name = handle_name(&handle).unwrap_or_else(|| "selected file".to_string());
+    set_handle(handle);
+    Ok(file_name)
 }
 
 /// Open a document from disk. Replaces the current document
 /// atomically on success; on any failure the existing document is
 /// untouched (D5).
 ///
-/// Returns `Ok(())` after the new document has been swapped in and
-/// the committed canvas has been repainted from it. The caller
-/// should clear the dirty flag.
-pub async fn open() -> Result<(), PersistError> {
+/// Returns the opened file name after the new document has been swapped in and
+/// the committed canvas has been repainted from it. The caller should clear the
+/// dirty flag and use the name to identify the current save target.
+pub async fn open() -> Result<String, PersistError> {
     let handle = match fsa_show_open_picker().await {
         Ok(h) if h.is_undefined() || h.is_null() => {
             return Err(PersistError::Cancelled);
@@ -132,6 +162,7 @@ pub async fn open() -> Result<(), PersistError> {
     with_state(|state| {
         *state.document.borrow_mut() = new_doc;
     });
+    let file_name = handle_name(&handle).unwrap_or_else(|| "selected file".to_string());
     set_handle(handle);
 
     // Repaint from the newly-loaded document so the user sees what
@@ -141,7 +172,19 @@ pub async fn open() -> Result<(), PersistError> {
         render::repaint_committed(&doc);
     });
 
-    Ok(())
+    Ok(file_name)
+}
+
+/// Clear the active file handle.
+///
+/// Used by New, which creates an unsaved document that should prompt on the
+/// next Save even if the previous session had an active file.
+pub fn forget_handle() {
+    STATE.with(|s| {
+        if let Some(state) = s.borrow_mut().as_mut() {
+            state.handle = None;
+        }
+    });
 }
 
 // ---- internal helpers ---------------------------------------------------
@@ -166,6 +209,13 @@ fn set_handle(handle: JsValue) {
             state.handle = Some(handle);
         }
     });
+}
+
+fn handle_name(handle: &JsValue) -> Option<String> {
+    js_sys::Reflect::get(handle, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn suggested_filename(doc: &Document) -> String {

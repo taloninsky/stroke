@@ -2,7 +2,8 @@
 //!
 //! This module defines the in-memory Rust types and the `serde`
 //! (de)serialization that produces and consumes the JSON format
-//! described in `docs/spec.md`, Decision 3.
+//! described in `docs/spec.md`, Decision 3, and extended by
+//! `docs/spec-v0.2.md`, Decision 13.
 //!
 //! The on-disk JSON is the contract; the in-memory representation is
 //! allowed to diverge from it (richer types, computed fields) so long
@@ -11,11 +12,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The schema identifier written to and required from every v0.1 file.
+/// The schema identifier written to and required from every v0.2 file.
 ///
 /// Any document with a different `schema` value is rejected on load
-/// with no attempt at migration (D5: strict version validation).
-pub const SCHEMA_V0_1: &str = "stroke.document/v0.1";
+/// with no attempt at migration (D13: no v0.1 migration requirement).
+pub const SCHEMA_V0_2: &str = "stroke.document/v0.2";
 
 /// Errors raised by the document model.
 ///
@@ -27,7 +28,7 @@ pub enum DocumentError {
     #[error("file is not valid JSON: {0}")]
     InvalidJson(#[from] serde_json::Error),
 
-    /// The JSON parsed but its `schema` field is not what v0.1 accepts.
+    /// The JSON parsed but its `schema` field is not what v0.2 accepts.
     #[error("unsupported schema version: {0}")]
     UnsupportedSchema(String),
 }
@@ -35,7 +36,7 @@ pub enum DocumentError {
 /// A complete stroke document — the root of the on-disk JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
-    /// Versioned schema id. Must equal [`SCHEMA_V0_1`] for v0.1.
+    /// Versioned schema id. Must equal [`SCHEMA_V0_2`] for v0.2.
     pub schema: String,
 
     /// Document-local identifier. Unique within this file only;
@@ -60,13 +61,13 @@ pub struct Document {
 }
 
 impl Document {
-    /// Create an empty v0.1 document with the given canvas dimensions.
+    /// Create an empty v0.2 document with the given canvas dimensions.
     ///
-    /// `id` is supplied by the caller; for v0.1 there is one document
+    /// `id` is supplied by the caller; for v0.2 there is one document
     /// per session and a constant id (e.g. `1`) is fine.
     pub fn new(id: u32, canvas: Canvas) -> Self {
         Self {
-            schema: SCHEMA_V0_1.to_string(),
+            schema: SCHEMA_V0_2.to_string(),
             id,
             created_at: chrono::Utc::now(),
             // The first allocatable id; bump every time we hand one out.
@@ -103,7 +104,7 @@ impl Document {
     /// error and the caller's existing state is untouched (D5).
     pub fn from_json(text: &str) -> Result<Self, DocumentError> {
         let doc: Document = serde_json::from_str(text)?;
-        if doc.schema != SCHEMA_V0_1 {
+        if doc.schema != SCHEMA_V0_2 {
             return Err(DocumentError::UnsupportedSchema(doc.schema));
         }
         Ok(doc)
@@ -118,14 +119,14 @@ impl Document {
 pub struct Canvas {
     pub width: f64,
     pub height: f64,
-    /// v0.1 only value: `"css_px"`.
+    /// v0.2 only value: `"css_px"`.
     pub units: String,
-    /// v0.1 only value: `"top_left"`.
+    /// v0.2 only value: `"top_left"`.
     pub origin: String,
 }
 
 impl Canvas {
-    /// Construct a default v0.1 canvas of the given CSS-pixel size.
+    /// Construct a default v0.2 canvas of the given CSS-pixel size.
     pub fn css_px(width: f64, height: f64) -> Self {
         Self {
             width,
@@ -140,25 +141,55 @@ impl Canvas {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub id: u32,
-    /// v0.1 hardcoded `"local-user"`. Recording this now avoids a
+    /// Hardcoded `"local-user"`. Recording this now avoids a
     /// migration when multi-author / AI-as-author lands (D3).
     pub author_id: String,
-    /// v0.1 only value: `"pen"`.
+    /// v0.2 only value: `"pen"`.
     pub tool: String,
-    /// `#RRGGBB`. v0.1 always `"#000000"`. Render reads from this field.
+    /// `#RRGGBB`. v0.2 always `"#000000"`. Render reads from this field.
     pub color: String,
-    /// CSS pixels. v0.1 default `2.0`. Render reads from this field.
+    /// CSS pixels. v0.2 default `2.0`. Render reads from this field.
     pub width: f64,
     /// Absolute start time of the stroke (ISO 8601, UTC).
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Browser-reported input family for the stroke. Pressure remains
+    /// deliberately absent until target-device testing proves useful data.
+    pub pointer_type: PointerType,
     /// At least one point. Order is draw order.
     pub points: Vec<Point>,
+}
+
+/// Browser pointer family captured at stroke level in v0.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerType {
+    /// Mouse input.
+    Mouse,
+    /// Stylus / pen input.
+    Pen,
+    /// Touch input.
+    Touch,
+    /// Missing or unrecognized browser pointer type.
+    Unknown,
+}
+
+impl PointerType {
+    /// Convert the browser's `PointerEvent.pointerType` string into
+    /// the v0.2 schema enum, preserving unknown values as `unknown`.
+    pub fn from_browser(value: &str) -> Self {
+        match value {
+            "mouse" => Self::Mouse,
+            "pen" => Self::Pen,
+            "touch" => Self::Touch,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// A single sampled point within a stroke.
 ///
 /// `pressure`, `tiltX`, `tiltY` are reserved for v0.2+ when real stylus
-/// hardware is in the loop. They are deliberately absent from v0.1
+/// hardware is in the loop. They are deliberately absent from v0.2
 /// output — recording the synthetic values a mouse reports would
 /// pollute the file (D2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -186,6 +217,7 @@ mod tests {
             color: "#000000".to_string(),
             width: 2.0,
             started_at: doc.created_at,
+            pointer_type: PointerType::Mouse,
             points: vec![
                 Point {
                     x: 100.5,
@@ -247,6 +279,37 @@ mod tests {
     }
 
     #[test]
+    fn v0_2_schema_is_written() {
+        let doc = sample_doc();
+        let json = doc.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema"], SCHEMA_V0_2);
+        assert_eq!(value["strokes"][0]["pointer_type"], "mouse");
+    }
+
+    #[test]
+    fn rejects_v0_1_schema() {
+        let mut doc = sample_doc();
+        doc.schema = "stroke.document/v0.1".to_string();
+        let json = serde_json::to_string(&doc).unwrap();
+        match Document::from_json(&json) {
+            Err(DocumentError::UnsupportedSchema(v)) => {
+                assert_eq!(v, "stroke.document/v0.1");
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pointer_type_from_browser_maps_known_values() {
+        assert_eq!(PointerType::from_browser("mouse"), PointerType::Mouse);
+        assert_eq!(PointerType::from_browser("pen"), PointerType::Pen);
+        assert_eq!(PointerType::from_browser("touch"), PointerType::Touch);
+        assert_eq!(PointerType::from_browser(""), PointerType::Unknown);
+        assert_eq!(PointerType::from_browser("eraser"), PointerType::Unknown);
+    }
+
+    #[test]
     fn rejects_invalid_json() {
         match Document::from_json("not json at all") {
             Err(DocumentError::InvalidJson(_)) => {}
@@ -260,7 +323,7 @@ mod tests {
     /// pattern.
     #[test]
     fn failed_parse_returns_error_not_partial_doc() {
-        let bad = r#"{ "schema": "stroke.document/v0.1", "id": 1 }"#;
+        let bad = r#"{ "schema": "stroke.document/v0.2", "id": 1 }"#;
         assert!(Document::from_json(bad).is_err());
     }
 

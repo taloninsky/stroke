@@ -1,12 +1,14 @@
 //! Two-canvas renderer (D4).
 //!
-//! v0.1 responsibilities:
+//! v0.2 responsibilities:
 //! - Own the committed and live `<canvas>` elements after the app
 //!   shell mounts them.
 //! - Size both canvases for the device pixel ratio and scale their
 //!   2D contexts so all draw calls take CSS-pixel coordinates.
+//! - Keep the bitmap size synchronized with the CSS drawing surface
+//!   using `ResizeObserver`; repaint committed strokes after every resize.
 //! - Repaint the committed canvas from a `Document` (full repaint;
-//!   per D4 we do not optimize this in v0.1).
+//!   per D4 we keep this simple until document size demands more).
 //! - Append a single segment of the in-progress stroke to the live
 //!   canvas on each new point, and clear the live canvas when a
 //!   stroke completes.
@@ -16,9 +18,11 @@
 //! drawing layer that other modules (capture, persist) call into.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ResizeObserver};
 
 use crate::document::{Document, Point, Stroke};
 
@@ -33,6 +37,8 @@ struct RenderState {
     css_height: f64,
 }
 
+type ResizeClosure = Closure<dyn FnMut(js_sys::Array, ResizeObserver)>;
+
 thread_local! {
     /// Module-level handle to the renderer. `None` until `init()`
     /// runs; remains `Some` for the lifetime of the page.
@@ -42,6 +48,12 @@ thread_local! {
     /// draw operation). Re-entrancy would be a bug; if it ever
     /// happens, the panic will be loud and immediate.
     static STATE: RefCell<Option<RenderState>> = const { RefCell::new(None) };
+    /// Resize observer kept alive for the page lifetime. Observing the parent
+    /// container, not the canvases, avoids feedback loops when we update canvas
+    /// bitmap attributes in response to layout changes.
+    static RESIZE_OBSERVER: RefCell<Option<ResizeObserver>> = const { RefCell::new(None) };
+    /// JS callback backing the observer. It must live as long as the observer.
+    static RESIZE_CALLBACK: RefCell<Option<ResizeClosure>> = const { RefCell::new(None) };
 }
 
 /// Errors raised when wiring up the renderer.
@@ -57,65 +69,50 @@ pub enum RenderError {
     NotACanvas(&'static str),
     #[error("could not obtain a 2D context for `#{0}`")]
     NoContext(&'static str),
+    #[error("could not install ResizeObserver")]
+    ResizeObserverFailed,
 }
 
 /// Initialize the renderer.
 ///
 /// Looks up the two `<canvas>` elements declared by the app shell,
-/// sizes them for the current device pixel ratio, and caches their
-/// 2D contexts. Idempotent: calling `init()` again replaces the
-/// existing state (useful if we ever add a window-resize handler;
-/// not exercised in v0.1).
-pub fn init() -> Result<(), RenderError> {
+/// sizes them for the current device pixel ratio, caches their 2D contexts,
+/// and installs a `ResizeObserver` that keeps the bitmap size in lockstep
+/// with the CSS drawing surface. Idempotent: calling `init()` again replaces
+/// the existing render state and observer.
+pub fn init(document: Rc<RefCell<Document>>) -> Result<(), RenderError> {
     let window = web_sys::window().ok_or(RenderError::NoWindow)?;
-    let document = window.document().ok_or(RenderError::NoDocument)?;
+    let dom = window.document().ok_or(RenderError::NoDocument)?;
 
-    let committed_el = canvas_by_id(&document, "stroke-committed")?;
-    let live_el = canvas_by_id(&document, "stroke-live")?;
-
-    let dpr = window.device_pixel_ratio().max(1.0);
-    // We measure the *parent container* (the `relative flex-1`
-    // wrapper) rather than the canvas itself. The canvas has
-    // `position: absolute; inset: 0` so it inherits the parent's
-    // layout box, but the canvas's own `getBoundingClientRect()` can
-    // be stale or zero-sized depending on when in the frame
-    // lifecycle we run. The flex parent is reliably sized once
-    // Dioxus's commit + browser layout has happened.
+    let committed_el = canvas_by_id(&dom, "stroke-committed")?;
+    let live_el = canvas_by_id(&dom, "stroke-live")?;
     let parent = committed_el
         .parent_element()
         .ok_or(RenderError::ElementNotFound("stroke-committed parent"))?;
-    let rect = parent.get_bounding_client_rect();
-    let css_w = rect.width().max(1.0);
-    let css_h = rect.height().max(1.0);
 
-    size_canvas_to(&committed_el, css_w, css_h, dpr);
-    size_canvas_to(&live_el, css_w, css_h, dpr);
-
-    let committed = context_2d(&committed_el, "stroke-committed")?;
-    let live = context_2d(&live_el, "stroke-live")?;
-
-    // Scale once so all subsequent draw calls take CSS pixels.
-    // `unwrap()` here is acceptable: this scale call cannot fail
-    // for finite positive arguments (which `dpr.max(1.0)` guarantees).
-    committed.scale(dpr, dpr).expect("scale committed ctx");
-    live.scale(dpr, dpr).expect("scale live ctx");
-
-    STATE.with(|s| {
-        *s.borrow_mut() = Some(RenderState {
-            committed,
-            live,
-            css_width: css_w,
-            css_height: css_h,
-        });
-    });
+    resize_to_parent(&committed_el, &live_el)?;
+    repaint_committed(&document.borrow());
+    install_resize_observer(parent, committed_el, live_el, document)?;
 
     Ok(())
+}
+
+/// Return the current CSS-pixel drawing surface size.
+///
+/// Used when creating a new blank document so its coordinate frame matches the
+/// currently visible canvas rather than the startup fallback size.
+pub fn current_css_size() -> Option<(f64, f64)> {
+    STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|state| (state.css_width, state.css_height))
+    })
 }
 
 /// Repaint the committed canvas from scratch using `document`.
 ///
 /// Used by `persist` after a successful Open and by `capture` after
-/// a stroke commits. v0.1 does not optimize this; per D4, the cost
+/// a stroke commits. Stroke does not optimize this yet; per D4, the cost
 /// of a full repaint is paid only on discrete user actions.
 pub fn repaint_committed(document: &Document) {
     with_state(|state| {
@@ -208,6 +205,77 @@ fn context_2d(
         .map_err(|_| RenderError::NoContext(id))
 }
 
+fn install_resize_observer(
+    parent: web_sys::Element,
+    committed_el: HtmlCanvasElement,
+    live_el: HtmlCanvasElement,
+    document: Rc<RefCell<Document>>,
+) -> Result<(), RenderError> {
+    RESIZE_OBSERVER.with(|o| {
+        *o.borrow_mut() = None;
+    });
+    RESIZE_CALLBACK.with(|c| {
+        *c.borrow_mut() = None;
+    });
+
+    let committed_for_resize = committed_el.clone();
+    let live_for_resize = live_el.clone();
+    let callback: ResizeClosure = Closure::wrap(Box::new(move |_entries, _observer| {
+        if resize_to_parent(&committed_for_resize, &live_for_resize).is_ok() {
+            repaint_committed(&document.borrow());
+        }
+    }));
+
+    let observer = ResizeObserver::new(callback.as_ref().unchecked_ref())
+        .map_err(|_| RenderError::ResizeObserverFailed)?;
+    observer.observe(&parent);
+
+    RESIZE_CALLBACK.with(|c| {
+        *c.borrow_mut() = Some(callback);
+    });
+    RESIZE_OBSERVER.with(|o| {
+        *o.borrow_mut() = Some(observer);
+    });
+
+    Ok(())
+}
+
+fn resize_to_parent(
+    committed_el: &HtmlCanvasElement,
+    live_el: &HtmlCanvasElement,
+) -> Result<(), RenderError> {
+    let window = web_sys::window().ok_or(RenderError::NoWindow)?;
+    let dpr = window.device_pixel_ratio().max(1.0);
+    let parent = committed_el
+        .parent_element()
+        .ok_or(RenderError::ElementNotFound("stroke-committed parent"))?;
+    let rect = parent.get_bounding_client_rect();
+    let css_w = rect.width().max(1.0);
+    let css_h = rect.height().max(1.0);
+
+    size_canvas_to(committed_el, css_w, css_h, dpr);
+    size_canvas_to(live_el, css_w, css_h, dpr);
+
+    let committed = context_2d(committed_el, "stroke-committed")?;
+    let live = context_2d(live_el, "stroke-live")?;
+
+    // Setting canvas width/height resets the transform, so every resize must
+    // reapply the DPR scale before future CSS-pixel draw calls.
+    committed.scale(dpr, dpr).expect("scale committed ctx");
+    live.scale(dpr, dpr).expect("scale live ctx");
+
+    STATE.with(|s| {
+        *s.borrow_mut() = Some(RenderState {
+            committed,
+            live,
+            css_width: css_w,
+            css_height: css_h,
+        });
+    });
+
+    Ok(())
+}
+
 /// Size a canvas to a known CSS-pixel size, accounting for DPR.
 ///
 /// We accept the CSS size as input rather than reading it from the
@@ -226,7 +294,7 @@ fn clear(ctx: &CanvasRenderingContext2d, css_w: f64, css_h: f64) {
 }
 
 /// Apply per-stroke style so subsequent path operations on `ctx`
-/// honor the stroke's color, width, and the v0.1 cap/join (D4).
+/// honor the stroke's color, width, and cap/join policy (D4).
 fn configure_stroke_style(ctx: &CanvasRenderingContext2d, stroke: &Stroke) {
     ctx.set_stroke_style_str(&stroke.color);
     ctx.set_line_width(stroke.width);
