@@ -56,39 +56,48 @@ fn SupportedShell() -> Element {
     // The dirty flag is a signal so the toolbar can react to it.
     let dirty = use_signal(|| false);
 
-    // Wire renderer + capture + persist once after the canvases
-    // exist in the DOM. Empty dependency list → runs after first
-    // paint, never again. The document and dirty handle are
-    // captured by `move` and persist for the lifetime of the page.
+    // Wire renderer + capture + persist once the canvas's parent
+    // container has actually been laid out at full size. We poll
+    // via `requestAnimationFrame`: Dioxus commits the DOM before
+    // `use_effect` fires, but the browser may not have finished
+    // flex layout yet — and one rAF is empirically not always
+    // enough (we have observed `flex-1` parents reporting only
+    // ~150px of height on the first rAF, then expanding to the
+    // viewport on the next). We retry until the parent reports a
+    // realistic size, with a hard cap so we cannot loop forever
+    // on a genuinely unsized container.
     use_effect(move || {
-        if let Err(err) = render::init() {
-            web_sys::console::error_1(&format!("render::init failed: {err}").into());
-            return;
-        }
-
-        // Initial canvas size for the document is the live canvas's
-        // CSS size at mount time. Sufficient for v0.1 (no resize
-        // handling). The exact value is not load-bearing — it only
-        // declares the coordinate frame for the file format.
-        let (w, h) = canvas_css_size("stroke-committed").unwrap_or((1280.0, 800.0));
-        let doc = Rc::new(RefCell::new(Document::new(1, Canvas::css_px(w, h))));
-
-        // `Signal` is `Copy`; we can call `.set` from a `Fn` closure
-        // by moving the (copied) signal handle into it.
         let dirty_handle = dirty;
-        if let Err(err) = capture::init(doc.clone(), move || dirty_handle.clone().set(true)) {
-            web_sys::console::error_1(&format!("capture::init failed: {err}").into());
-        }
+        wait_for_layout_then(move || {
+            if let Err(err) = render::init() {
+                web_sys::console::error_1(&format!("render::init failed: {err}").into());
+                return;
+            }
 
-        persist::init(doc);
+            // Initial canvas size for the document is the live
+            // canvas's CSS size at mount time. Sufficient for v0.1
+            // (no resize handling). The exact value is not
+            // load-bearing — it only declares the coordinate frame
+            // for the file format.
+            let (w, h) = canvas_css_size("stroke-committed").unwrap_or((1280.0, 800.0));
+            let doc = Rc::new(RefCell::new(Document::new(1, Canvas::css_px(w, h))));
 
-        // beforeunload guard (D5). The browser only honors the
-        // prompt when the listener sets `returnValue` to a
-        // non-empty string AND calls `preventDefault`. The exact
-        // string is ignored by modern browsers but must be
-        // non-empty. We register the listener once and let it
-        // re-read the live dirty state on every fire.
-        install_beforeunload_guard(dirty);
+            // `Signal` is `Copy`; we can call `.set` from a `Fn`
+            // closure by moving the (copied) signal handle into it.
+            if let Err(err) = capture::init(doc.clone(), move || dirty_handle.clone().set(true)) {
+                web_sys::console::error_1(&format!("capture::init failed: {err}").into());
+            }
+
+            persist::init(doc);
+
+            // beforeunload guard (D5). The browser only honors the
+            // prompt when the listener sets `returnValue` to a
+            // non-empty string AND calls `preventDefault`. The
+            // exact string is ignored by modern browsers but must
+            // be non-empty. We register the listener once and let
+            // it re-read the live dirty state on every fire.
+            install_beforeunload_guard(dirty_handle);
+        });
     });
 
     rsx! {
@@ -193,22 +202,93 @@ fn is_fsa_supported() -> bool {
     value.is_function()
 }
 
-/// Returns the CSS-pixel size of the canvas element with the given
-/// id, if it can be located. Used at app startup to seed the
-/// document's coordinate frame (D3) with the actual rendered size
-/// of the drawing surface.
+/// Returns the CSS-pixel size of the parent of the canvas element
+/// with the given id, if it can be located. We measure the parent
+/// (the flex container) rather than the canvas because the
+/// canvas's own `getBoundingClientRect` can be unreliable during
+/// the first paint pass — see `render::init` for the same trick.
 fn canvas_css_size(id: &str) -> Option<(f64, f64)> {
     let canvas = web_sys::window()?.document()?.get_element_by_id(id)?;
-    Some((canvas.client_width() as f64, canvas.client_height() as f64))
+    let parent = canvas.parent_element()?;
+    let rect = parent.get_bounding_client_rect();
+    Some((rect.width(), rect.height()))
+}
+
+/// Schedules `init` to run as soon as the canvas's parent
+/// container has reached a realistic size, polling on
+/// `requestAnimationFrame`.
+///
+/// We need to defer initialization until layout is settled so the
+/// renderer can size the canvas bitmap to the actual CSS box. A
+/// single rAF after `use_effect` is not always enough: Dioxus + the
+/// browser sometimes report the flex parent at a stub size on the
+/// first frame and only expand it on a subsequent frame.
+///
+/// We give up after `MAX_FRAMES` frames and proceed anyway. That
+/// is a defensive limit, not an expected path; if it ever fires
+/// the user will see a misaligned cursor and we will hear about it.
+/// Sub-100ms cap so the user notices the delay only as a single
+/// pre-paint pause, not as a hung canvas.
+fn wait_for_layout_then(init: impl FnOnce() + 'static) {
+    /// Maximum number of animation frames we will wait. At ~60Hz
+    /// this is roughly 100ms of wall-clock time.
+    const MAX_FRAMES: u32 = 6;
+    /// Minimum CSS-pixel height we treat as "laid out". Anything
+    /// less suggests the flex parent has not expanded yet — the
+    /// HTML default canvas is 150px tall, so we set the bar
+    /// comfortably above that.
+    const MIN_HEIGHT: f64 = 200.0;
+
+    let Some(window) = web_sys::window() else {
+        init();
+        return;
+    };
+
+    // Type aliases keep clippy happy and call sites readable.
+    type InitCell = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+    type ClosureCell = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+
+    // Shared cell so the rAF closure can re-arm itself.
+    let init_cell: InitCell = Rc::new(RefCell::new(Some(Box::new(init))));
+    let frames_left = Rc::new(RefCell::new(MAX_FRAMES));
+    let closure_holder: ClosureCell = Rc::new(RefCell::new(None));
+
+    let window_cl = window.clone();
+    let init_cell_cl = init_cell.clone();
+    let frames_left_cl = frames_left.clone();
+    let closure_holder_cl = closure_holder.clone();
+
+    let closure = Closure::wrap(Box::new(move || {
+        let height = canvas_css_size("stroke-committed")
+            .map(|(_, h)| h)
+            .unwrap_or(0.0);
+        let mut remaining = frames_left_cl.borrow_mut();
+
+        if height >= MIN_HEIGHT || *remaining == 0 {
+            // Drop our self-reference and run init exactly once.
+            // Drop the closure handle first so we are not holding
+            // it across the user-supplied init call.
+            let _ = closure_holder_cl.borrow_mut().take();
+            if let Some(init) = init_cell_cl.borrow_mut().take() {
+                init();
+            }
+            return;
+        }
+
+        *remaining -= 1;
+        if let Some(closure) = closure_holder_cl.borrow().as_ref() {
+            let _ = window_cl.request_animation_frame(closure.as_ref().unchecked_ref());
+        }
+    }) as Box<dyn FnMut()>);
+
+    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+    *closure_holder.borrow_mut() = Some(closure);
 }
 
 /// Installs a `beforeunload` listener that prompts the user when
 /// there are unsaved changes (D5). The browser's native dialog is
 /// the only thing that can intercept tab-close; modern browsers
 /// ignore custom messages but require `returnValue` to be set.
-///
-/// The closure is intentionally leaked: it must outlive every
-/// possible unload event, which means the lifetime of the page.
 fn install_beforeunload_guard(dirty: Signal<bool>) {
     let Some(window) = web_sys::window() else {
         return;

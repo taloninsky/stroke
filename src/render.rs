@@ -74,8 +74,22 @@ pub fn init() -> Result<(), RenderError> {
     let live_el = canvas_by_id(&document, "stroke-live")?;
 
     let dpr = window.device_pixel_ratio().max(1.0);
-    let (css_w, css_h) = size_canvas_for_dpr(&committed_el, dpr);
-    size_canvas_for_dpr(&live_el, dpr);
+    // We measure the *parent container* (the `relative flex-1`
+    // wrapper) rather than the canvas itself. The canvas has
+    // `position: absolute; inset: 0` so it inherits the parent's
+    // layout box, but the canvas's own `getBoundingClientRect()` can
+    // be stale or zero-sized depending on when in the frame
+    // lifecycle we run. The flex parent is reliably sized once
+    // Dioxus's commit + browser layout has happened.
+    let parent = committed_el
+        .parent_element()
+        .ok_or(RenderError::ElementNotFound("stroke-committed parent"))?;
+    let rect = parent.get_bounding_client_rect();
+    let css_w = rect.width().max(1.0);
+    let css_h = rect.height().max(1.0);
+
+    size_canvas_to(&committed_el, css_w, css_h, dpr);
+    size_canvas_to(&live_el, css_w, css_h, dpr);
 
     let committed = context_2d(&committed_el, "stroke-committed")?;
     let live = context_2d(&live_el, "stroke-live")?;
@@ -194,21 +208,17 @@ fn context_2d(
         .map_err(|_| RenderError::NoContext(id))
 }
 
-/// Size a canvas for the device pixel ratio.
+/// Size a canvas to a known CSS-pixel size, accounting for DPR.
 ///
-/// Returns the CSS-pixel size (which is what callers and the schema
-/// see). The bitmap size is set to `css * dpr` so high-DPI displays
-/// render sharply.
-fn size_canvas_for_dpr(canvas: &HtmlCanvasElement, dpr: f64) -> (f64, f64) {
-    // The CSS size is whatever the surrounding flex layout has given
-    // the element. `client_width`/`client_height` report CSS pixels.
-    let css_w = canvas.client_width() as f64;
-    let css_h = canvas.client_height() as f64;
+/// We accept the CSS size as input rather than reading it from the
+/// canvas because the canvas's own bounding rect can be unreliable
+/// during the first paint pass — see `init()` for the parent-element
+/// workaround.
+fn size_canvas_to(canvas: &HtmlCanvasElement, css_w: f64, css_h: f64, dpr: f64) {
     let bitmap_w = (css_w * dpr).round() as u32;
     let bitmap_h = (css_h * dpr).round() as u32;
     canvas.set_width(bitmap_w);
     canvas.set_height(bitmap_h);
-    (css_w, css_h)
 }
 
 fn clear(ctx: &CanvasRenderingContext2d, css_w: f64, css_h: f64) {

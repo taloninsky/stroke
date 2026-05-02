@@ -162,11 +162,8 @@ fn on_pointerdown(event: PointerEvent) {
     }
 
     let now = performance_now();
-    let point = Point {
-        x: event.offset_x() as f64,
-        y: event.offset_y() as f64,
-        t: 0.0,
-    };
+    let (x, y) = point_in_canvas(&event);
+    let point = Point { x, y, t: 0.0 };
     let stroke_id = with_state_mut(|state| state.document.borrow_mut().allocate_id());
     let stroke = Stroke {
         id: stroke_id,
@@ -190,9 +187,10 @@ fn on_pointerdown(event: PointerEvent) {
 }
 
 fn on_pointermove(event: PointerEvent) {
+    let (x, y) = point_in_canvas(&event);
     let next = Point {
-        x: event.offset_x() as f64,
-        y: event.offset_y() as f64,
+        x,
+        y,
         // `event.timeStamp` is `DOMHighResTimeStamp` (ms, fractional)
         // measured against the same epoch as `performance.now()`.
         t: event.time_stamp() - started_perf_or_now(event.time_stamp()),
@@ -282,6 +280,36 @@ fn performance_now() -> f64 {
         .and_then(|w| w.performance())
         .map(|p| p.now())
         .unwrap_or(0.0)
+}
+
+/// Convert a pointer event's viewport coordinates into CSS-pixel
+/// coordinates relative to the canvas the listener is attached to.
+///
+/// We deliberately avoid `event.offset_x/y()`. Those are computed
+/// against the event's *target*, which under pointer-capture can
+/// drift from the listener's element (and on some browsers can also
+/// be affected by transformed ancestors). `currentTarget` always
+/// points at the element the listener was registered on — for us,
+/// the committed canvas. Subtracting its live `getBoundingClientRect`
+/// from `clientX/Y` yields stable CSS-pixel coordinates that line up
+/// with what the renderer draws (which also takes CSS pixels, since
+/// the 2D context was scaled by DPR at init time).
+fn point_in_canvas(event: &PointerEvent) -> (f64, f64) {
+    let Some(canvas) = event
+        .current_target()
+        .and_then(|t| t.dyn_into::<HtmlCanvasElement>().ok())
+    else {
+        // Fallback: if the listener somehow fired without a canvas
+        // currentTarget, use the raw client coords. Better than
+        // dropping the point silently — the resulting offset will be
+        // visibly wrong and easy to spot in testing.
+        return (event.client_x() as f64, event.client_y() as f64);
+    };
+    let rect = canvas.get_bounding_client_rect();
+    (
+        event.client_x() as f64 - rect.left(),
+        event.client_y() as f64 - rect.top(),
+    )
 }
 
 /// Returns the start-of-stroke `performance.now()` value if a stroke
